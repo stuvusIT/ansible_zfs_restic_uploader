@@ -1,0 +1,3 @@
+- name: Reload systemd configuration
+  service:
+    daemon_reload: True
