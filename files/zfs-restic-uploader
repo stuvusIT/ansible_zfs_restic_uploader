@@ -7,27 +7,106 @@ import subprocess
 import datetime
 import json
 import udatetime
+import re
+import shlex
+import sys
+
 
 ZFS_SNAPSHOTDIR = '.zfs/snapshot'
 
 SNAPSHOT_TAG = "snapshot="
 LOGICAL_REFERENCED_TAG = "logicalreferenced="
+VOLSIZE_TAG = "volsize="
 
 DEBUG = False
 
-
-def _run(command: str, input: Optional[str] = None, void_stderr: bool = False) -> None:
-    other_args = dict()
-    if void_stderr and not DEBUG:
-        other_args["stderr"] = subprocess.DEVNULL
-    subprocess.run(command, shell=True, text=True, input=input, **other_args)
+ENV = {
+    **os.environ,
+    "RESTIC_PROGRESS_FPS": "0.005",
+}
 
 
-def _eval(command: str, input: Optional[str] = None, void_stderr: bool = False) -> str:
-    other_args = dict()
-    if void_stderr and not DEBUG:
-        other_args["stderr"] = subprocess.DEVNULL
-    return subprocess.run(command, shell=True, text=True, stdout=subprocess.PIPE, input=input, **other_args).stdout
+# class which we use to prevent buffering stdout
+class Unbuffered(object):
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, data):
+        self.stream.write(data)
+        self.stream.flush()
+
+    def writelines(self, datas):
+        self.stream.writelines(datas)
+        self.stream.flush()
+
+    def __getattr__(self, attr):
+        return getattr(self.stream, attr)
+
+
+class RedirectStdStreams(object):
+    def __init__(self, stdout=None, stderr=None):
+        self._stdout = stdout or sys.stdout
+        self._stderr = stderr or sys.stderr
+
+    def __enter__(self):
+        self.old_stdout, self.old_stderr = sys.stdout, sys.stderr
+        self.old_stdout.flush()
+        self.old_stderr.flush()
+        sys.stdout, sys.stderr = self._stdout, self._stderr
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._stdout.flush()
+        self._stderr.flush()
+        sys.stdout = self.old_stdout
+        sys.stderr = self.old_stderr
+
+
+def _run(
+        command: List[str],
+        input: Optional[str] = None,
+        stdout=None,
+        stderr=None,
+        check: bool = True) -> None:
+    return subprocess.run(
+        command,
+        text=True,
+        input=input,
+        stdout=stdout,
+        stderr=stderr,
+        check=check,
+        env=ENV)
+
+
+def _run_and_get_stdout(
+        command: List[str],
+        input: Optional[str] = None,
+        stderr=None,
+        check: bool = True) -> None:
+    stdout = subprocess.PIPE
+    return subprocess.run(
+        command,
+        text=True,
+        input=input,
+        stdout=stdout,
+        stderr=stderr,
+        check=check,
+        env=ENV).stdout
+
+
+def _run_and_get_stderr(
+        command: List[str],
+        input: Optional[str] = None,
+        stdout=None,
+        check: bool = True) -> None:
+    stderr = subprocess.PIPE
+    return subprocess.run(
+        command,
+        text=True,
+        input=input,
+        stdout=stdout,
+        stderr=stderr,
+        check=check,
+        env=ENV).stderr
 
 
 def _get_year(timestamp: int) -> int:
@@ -42,27 +121,44 @@ def _get_week(timestamp: int) -> int:
     return datetime.datetime.fromtimestamp(timestamp).isocalendar()[1]
 
 
-class Backuper:
+class Backupper:
 
     def __init__(self,
                  restic_repo_prefix: str,
                  zfs_dataset_common_prefix: str,
                  restic_password_file: str,
-                 dry_run: bool):
+                 exclude_snapnames_regex: str,
+                 check: bool,
+                 dry_run: bool,
+                 release: List[str]):
         self.restic_repo_prefix: str = restic_repo_prefix.rstrip("/")
         self.zfs_dataset_common_prefix: str = zfs_dataset_common_prefix
         self.restic_password_file: str = restic_password_file
+        self.exclude_snapnames_regex = re.compile(exclude_snapnames_regex)
+        self.check = check
         self.dry_run: bool = dry_run
         self._dry_run_finished_backups: List[Dict[str, Any]] = []
+        self.release = release
 
-    def _restic_cmd(self, restic_repo: str, restic_command: str, flags: List[str] = []) -> str:
-        initial_args = ["-r", restic_repo, "--password-file", self.restic_password_file, restic_command]
-        args = initial_args + flags
-        arg_string = " ".join([f"'{arg}'" for arg in args])
-        return f"restic {arg_string}"
+    def _restic_cmd(self, restic_repo: str, args: List[str] = []) -> str:
+        return [
+            "restic",
+            "-r",
+            restic_repo,
+            "--password-file",
+            self.restic_password_file,
+            "--cleanup-cache"] + args
 
-    def _get_dataset_snapshots(self, dataset_name: str) -> List[Dict[str, Any]]:
-        lines = _eval(f"sudo zfs list -Hp -o name,creation,used,logicalreferenced -t snapshot '{dataset_name}'")
+    def _get_dataset_snapshots(
+            self, dataset_name: str, is_volume: bool) -> List[Dict[str, Any]]:
+        lines = _run_and_get_stdout(["zfs",
+                                     "list",
+                                     "-Hp",
+                                     "-o",
+                                     "name,creation,used,logicalreferenced,volsize",
+                                     "-t",
+                                     "snapshot",
+                                     dataset_name])
         snapshots: List[Dict[str, Any]] = []
         for line in lines.split("\n"):
             if len(line) == 0:
@@ -73,19 +169,50 @@ class Backuper:
                 "creation": int(values[1]),
                 "used": int(values[2]),
                 "logicalreferenced": int(values[3]),
+                "volsize": int(values[4]) if values[4] != "-" else None,
             }
             snapshots.append(snapshot)
         snapshots_with_size = []
+        next = 0
         for i, snapshot in enumerate(snapshots):
-            if i == 0 or snapshots[i - 1]["used"] != 0:
-                snapshots_with_size.append(snapshot)
+            if i < next:
                 continue
-            parent_name = snapshots[i - 1]["name"]
-            snapshot_name = snapshot["name"]
-            if "0\n" != _eval(f"zfs diff {dataset_name}@{parent_name} {dataset_name}@{snapshot_name} 2>&1 | head -c1 | wc -c"):
-                snapshots_with_size.append(snapshot)
+            next = i
+
+            # Exclude snapshot(s) by regex
+            while next < len(snapshots) and self.exclude_snapnames_regex.match(
+                    snapshots[next]['name']):
+                # We intentionally do not call _release() here, because
+                # snapshots excluded by regex should be completely ignored.
+                next += 1
+            if next > i:
+                if next == i + 1:
+                    print(
+                        f"{dataset_name}@{snapshots[i]['name']} excluded by regex")
+                else:
+                    print(
+                        f"{dataset_name}@{snapshots[i]['name']} and {next-i-1} subsequent snapshot(s) excluded by regex")
                 continue
-            print(F"Not considering snapshot {dataset_name}@{snapshot_name} because of zero diff.")
+
+            if i != 0 and not is_volume:
+                # Exclude snapshot(s) when they're identical to their parent
+                while next < len(snapshots) and snapshots[next - 1]['used'] == 0 and "0\n" == _run_and_get_stdout([
+                    "bash",
+                    "-c",
+                    f"set -eo pipefail; zfs diff {shlex.quote(dataset_name+'@'+snapshots[next-1]['name'])} {shlex.quote(dataset_name+'@'+snapshots[next]['name'])} 2>&1 | head -c1 | wc -c"
+                ]):
+                    self._release(dataset_name, snapshots[next]['name'])
+                    next += 1
+                if next > i:
+                    if next == i + 1:
+                        print(
+                            f"{dataset_name}@{snapshots[i]['name']} excluded because identical to parent")
+                    else:
+                        print(
+                            f"{dataset_name}@{snapshots[i]['name']} and {next-i-1} subsequent snapshot(s) excluded because identical to parent")
+                    continue
+
+            snapshots_with_size.append(snapshots[i])
         return snapshots_with_size
 
     def _get_snapshot_tag(self, datum: Dict[str, Any]) -> str:
@@ -96,8 +223,12 @@ class Backuper:
                 return tag[len(SNAPSHOT_TAG):]
         raise Exception("Snapshot does not have a valid snapshot tag.")
 
-    def _get_snapshots_in_restic(self, restic_repo: str) -> List[Dict[str, Any]]:
-        json_data = _eval(self._restic_cmd(restic_repo, "snapshots", ["--json"]))
+    def _get_snapshots_in_restic(
+            self, restic_repo: str) -> List[Dict[str, Any]]:
+        json_data = _run_and_get_stdout(
+            self._restic_cmd(
+                restic_repo, [
+                    "snapshots", "--json"]))
         data = json.loads(json_data)
         return [{
             "id": datum["id"],
@@ -106,59 +237,140 @@ class Backuper:
         } for datum in data]
 
     def _get_repo_name_and_path(self, dataset_name) -> Tuple[str, str]:
-        ds_name_without_prefix = dataset_name.removeprefix(self.zfs_dataset_common_prefix).strip("/")
+        ds_name_without_prefix = dataset_name.removeprefix(
+            self.zfs_dataset_common_prefix).strip("/")
         repo_name = "/".join([self.restic_repo_prefix, ds_name_without_prefix])
         path_in_restic_repo = "/" + ds_name_without_prefix
 
         return repo_name, path_in_restic_repo
 
     def _init_restic_repo(self, restic_repo):
-        result = _eval(self._restic_cmd(restic_repo, "cat", ["config"]), void_stderr=True)
+        result = _run_and_get_stdout(
+            self._restic_cmd(
+                restic_repo, [
+                    "cat", "config"]), stderr=subprocess.DEVNULL, check=False)
         if "chunker_polynomial" not in result:
-            print(f"Initializing restic repo {restic_repo}.")
-            _run(self._restic_cmd(restic_repo, "init"))
+            print(f"Initializing Restic repo {restic_repo}.")
+            _run(self._restic_cmd(restic_repo, ["init"]))
         else:
             print(f"Restic repo {restic_repo} already initialized.")
 
     def _check_restic_repo(self, restic_repo):
-        print(f"Checking restic repo {restic_repo}.")
-        _run(self._restic_cmd(restic_repo, "check"))
+        print(f"Checking Restic repo {restic_repo}.")
+        _run(self._restic_cmd(restic_repo, ["check", "--quiet"]))
 
     def _pre(self, dataset_name):
-        _run(f"zfs mount {dataset_name}")
+        if "volume" == _run_and_get_stdout(
+                ["zfs", "get", "-Hp", "-o", "value", "type", dataset_name]).strip():
+            if "visible" != _run_and_get_stdout(
+                    ["zfs", "get", "-Hp", "-o", "value", "snapdev", dataset_name]).strip():
+                raise Exception(
+                    f"Snapdev not visible. This can be fixed with: zfs set snapdev=visible {shlex.quote(dataset_name)}")
+            is_volume = True
+        else:
+            is_volume = False
+            try:
+                _run_and_get_stderr(["zfs", "mount", dataset_name])
+            except subprocess.CalledProcessError as e:
+                if "filesystem already mounted" not in e.stderr:
+                    raise
         restic_repo, _ = self._get_repo_name_and_path(dataset_name)
         self._init_restic_repo(restic_repo)
+        return is_volume
 
     def _post(self, dataset_name):
-        restic_repo, _ = self._get_repo_name_and_path(dataset_name)
-        self._check_restic_repo(restic_repo)
+        if self.check:
+            restic_repo, _ = self._get_repo_name_and_path(dataset_name)
+            self._check_restic_repo(restic_repo)
 
-    def _backup_single_snapshot(self, dataset_name: str, snapshot: Dict[str, Any], parent_restic_snapshot_id: Optional[str]):
+    def _release(self, dataset_name, snapshot_name):
+        for tag in self.release:
+            if self.dry_run:
+                lines = _run_and_get_stdout(
+                    ["zfs", "holds", "-H", f"{dataset_name}@{snapshot_name}"]).split("\n")
+                for line in lines:
+                    if len(line) == 0:
+                        continue
+                    if tag == line.split("\t")[1]:
+                        print(
+                            f"Would release hold {tag} on {dataset_name}@{snapshot_name}")
+                        break
+            else:
+                try:
+                    _run_and_get_stderr(
+                        ["zfs", "release", tag, f"{dataset_name}@{snapshot_name}"])
+                except subprocess.CalledProcessError as e:
+                    if "no such tag on this dataset" in e.stderr:
+                        continue
+                    else:
+                        raise
+                print(f"Released hold {tag} on {dataset_name}@{snapshot_name}")
+
+    def _backup_single_snapshot(self,
+                                dataset_name: str,
+                                is_volume: bool,
+                                snapshot: Dict[str,
+                                               Any],
+                                parent_restic_snapshot_id: Optional[str]):
         snapshot_name = snapshot["name"]
-        restic_repo, path_in_restic_repo = self._get_repo_name_and_path(dataset_name)
+        restic_repo, path_in_restic_repo = self._get_repo_name_and_path(
+            dataset_name)
 
-        ds_mountpoint = _eval(f"zfs get -Hp -o value mountpoint '{dataset_name}'").strip()
-        snapshot_path = "/".join([ds_mountpoint, ZFS_SNAPSHOTDIR, snapshot_name])
+        if is_volume:
+            snapshot_path = f"/dev/zvol/{dataset_name}@{snapshot_name}"
+        else:
+            ds_mountpoint = _run_and_get_stdout(
+                ["zfs", "get", "-Hp", "-o", "value", "mountpoint", dataset_name]).strip()
+            snapshot_path = "/".join([ds_mountpoint,
+                                     ZFS_SNAPSHOTDIR, snapshot_name])
 
-        snapshot_time_readable = str(datetime.datetime.fromtimestamp(snapshot["creation"]))
+        snapshot_time_readable = str(
+            datetime.datetime.fromtimestamp(
+                snapshot["creation"]))
 
-        # Use proot to "mount" coorect path. See https://github.com/restic/restic/issues/2092
-        proot_command = f"proot -b '{snapshot_path}':'{path_in_restic_repo}'"
-        logical_referenced = snapshot["logicalreferenced"]
-        tags = [f"{SNAPSHOT_TAG}{snapshot_name}",
-                f"{LOGICAL_REFERENCED_TAG}{logical_referenced}"]
-        tags_with_flag = []
-        for tag in tags:
-            tags_with_flag.append("--tag")
-            tags_with_flag.append(tag)
-        restic_backup_args = ["--ignore-ctime", "--time", snapshot_time_readable, "--compression", "max"] + tags_with_flag
+        restic_backup_args = [
+            "backup",
+            "--ignore-ctime",
+            "--time",
+            snapshot_time_readable,
+            "--compression",
+            "max",
+            "--exclude-caches"]
+        restic_backup_args += ["--tag", SNAPSHOT_TAG + snapshot_name]
+        restic_backup_args += ["--tag", LOGICAL_REFERENCED_TAG +
+                               str(snapshot["logicalreferenced"])]
+
+        if is_volume:
+            restic_backup_args += ["--tag",
+                                   VOLSIZE_TAG + str(snapshot["volsize"])]
+
         if parent_restic_snapshot_id is not None:
             restic_backup_args += ["--parent", parent_restic_snapshot_id]
-        restic_backup_args.append(path_in_restic_repo)
-        restic_command = self._restic_cmd(restic_repo, "backup", restic_backup_args)
-        print(f"Starting backup of {dataset_name}@{snapshot_name} into {restic_repo} under {path_in_restic_repo}")
+
+        if is_volume:
+            restic_backup_args += ["--stdin-filename",
+                                   path_in_restic_repo,
+                                   "--stdin-from-command",
+                                   "--",
+                                   "dd",
+                                   f"if={snapshot_path}"]
+            proot_command = []
+        else:
+            restic_backup_args.append(path_in_restic_repo)
+            # Hack to allow colon in snapname
+            tmpdir = _run_and_get_stdout(["mktemp", "-d"]).strip()
+            _run(["ln", "-s", snapshot_path, f"{tmpdir}/snapshot"])
+            # Use proot to "mount" coorect path. See
+            # https://github.com/restic/restic/issues/2092#issuecomment-554230511
+            proot_command = [
+                "proot", "-b", f"{tmpdir}/snapshot:{path_in_restic_repo}"]
+
+        restic_command = self._restic_cmd(restic_repo, restic_backup_args)
+
+        print(f"^ starting backup into {restic_repo}")
         if self.dry_run:
-            print(f"Would run: {proot_command} {restic_command}")
+            print(f"Would run: " + " ".join([shlex.quote(arg)
+                  for arg in proot_command + restic_command]))
             id = len(self._dry_run_finished_backups)
             self._dry_run_finished_backups.append({
                 "id": f"__dry_run_{id}",
@@ -166,171 +378,388 @@ class Backuper:
                 "creation": snapshot["creation"],
             })
         else:
-            _run(f"{proot_command} {restic_command}")
+            _run(proot_command + restic_command)
+        self._release(dataset_name, snapshot_name)
 
-    def backup_single_snapshot(self, dataset_name: str, snapshot_name: str, parent_restic_snapshot_id: Optional[str]):
-        self._pre(dataset_name)
-        snapshots = self._get_dataset_snapshots(dataset_name)
-        snapshots_with_correct_name = [snapshot for snapshot in snapshots if snapshot["name"] == snapshot_name]
+    def backup_single_snapshot(
+            self,
+            dataset_name: str,
+            snapshot_name: str,
+            parent_restic_snapshot_id: Optional[str]):
+        is_volume = self._pre(dataset_name)
+        snapshots = self._get_dataset_snapshots(dataset_name, is_volume)
+        snapshots_with_correct_name = [
+            snapshot for snapshot in snapshots if snapshot["name"] == snapshot_name]
         if len(snapshots_with_correct_name) < 1:
             raise Exception("Did not find a snapshot with that name")
-        self._backup_single_snapshot(dataset_name, snapshots_with_correct_name[0], parent_restic_snapshot_id)
+        self._backup_single_snapshot(
+            dataset_name,
+            is_volume,
+            snapshots_with_correct_name[0],
+            parent_restic_snapshot_id)
         self._post(dataset_name)
 
-    def _is_among_n_newest(self, snapshots_to_consider: List[Dict[str, Any]], snapshot: Dict[str, Any], n: int):
-        num_newer = sum(s["creation"] > snapshot["creation"] for s in snapshots_to_consider)
-        return num_newer < n
+    def _among_n_newest(
+            self, snapshots_to_consider: List[Dict[str, Any]], snapshot: Dict[str, Any]):
+        num_newer = sum(s["creation"] > snapshot["creation"]
+                        for s in snapshots_to_consider)
+        return num_newer + 1
 
-    def _is_weekly(self, snapshots: List[Dict[str, Any]], snapshot: Dict[str, Any]) -> bool:
+    def _is_weekly(
+            self, snapshots: List[Dict[str, Any]], snapshot: Dict[str, Any]) -> bool:
         year = _get_year(snapshot["creation"])
         week = _get_week(snapshot["creation"])
-        snapshots_in_that_week = [snapshot for snapshot in snapshots if _get_week(snapshot["creation"]) == week and _get_year(snapshot["creation"]) == year]
-        return self._is_among_n_newest(snapshots_in_that_week, snapshot, 1)
+        snapshots_in_that_week = [
+            snapshot for snapshot in snapshots if _get_week(
+                snapshot["creation"]) == week and _get_year(
+                snapshot["creation"]) == year]
+        return self._among_n_newest(snapshots_in_that_week, snapshot) == 1
 
-    def _is_monthly(self, snapshots: List[Dict[str, Any]], snapshot: Dict[str, Any]) -> bool:
+    def _is_monthly(
+            self, snapshots: List[Dict[str, Any]], snapshot: Dict[str, Any]) -> bool:
         year = _get_year(snapshot["creation"])
         month = _get_month(snapshot["creation"])
-        snapshots_in_that_month = [snapshot for snapshot in snapshots if _get_month(snapshot["creation"]) == month and _get_year(snapshot["creation"]) == year]
-        return self._is_among_n_newest(snapshots_in_that_month, snapshot, 1)
+        snapshots_in_that_month = [
+            snapshot for snapshot in snapshots if _get_month(
+                snapshot["creation"]) == month and _get_year(
+                snapshot["creation"]) == year]
+        return self._among_n_newest(snapshots_in_that_month, snapshot) == 1
 
-    def _must_keep(self, snapshots: List[Dict[str, Any]], snapshot: Dict[str, Any], keep_last_n: Optional[int], keep_weekly_n: Optional[int], keep_monthly_n: Optional[int]) -> bool:
+    def _keep_reasons(self,
+                      snapshots: List[Dict[str,
+                                           Any]],
+                      snapshot: Dict[str,
+                                     Any],
+                      keep_last_n: Optional[int],
+                      keep_weekly_n: Optional[int],
+                      keep_monthly_n: Optional[int]) -> bool:
+        keep_reasons = []
         if keep_last_n is None and keep_weekly_n is None and keep_monthly_n is None:
-            return True
+            return ["any"]
 
         # Last n
-        if keep_last_n is not None and self._is_among_n_newest(snapshots, snapshot, keep_last_n):
-            return True
+        if keep_last_n is not None:
+            n = self._among_n_newest(snapshots, snapshot)
+            if n <= keep_last_n:
+                keep_reasons.append(f"last-{n}")
 
         # Weekly n
         if keep_weekly_n is not None and self._is_weekly(snapshots, snapshot):
             # This is a weekly snapshot
-            weekly_snapshots = [snapshot for snapshot in snapshots if self._is_weekly(snapshots, snapshot)]
-            if self._is_among_n_newest(weekly_snapshots, snapshot, keep_weekly_n):
-                return True
+            weekly_snapshots = [
+                snapshot for snapshot in snapshots if self._is_weekly(
+                    snapshots, snapshot)]
+            n = self._among_n_newest(weekly_snapshots, snapshot)
+            if n <= keep_weekly_n:
+                keep_reasons.append(f"weekly-{n}")
 
         # Monthly n
-        if keep_monthly_n is not None and self._is_monthly(snapshots, snapshot):
+        if keep_monthly_n is not None and self._is_monthly(
+                snapshots, snapshot):
             # This is a monthly snapshot
-            monthly_snapshots = [snapshot for snapshot in snapshots if self._is_monthly(snapshots, snapshot)]
-            if self._is_among_n_newest(monthly_snapshots, snapshot, keep_monthly_n):
-                return True
+            monthly_snapshots = [
+                snapshot for snapshot in snapshots if self._is_monthly(
+                    snapshots, snapshot)]
+            n = self._among_n_newest(monthly_snapshots, snapshot)
+            if n <= keep_monthly_n:
+                keep_reasons.append(f"monthly-{n}")
 
-        return False
+        return keep_reasons
 
-    def _find_next_snapshot(self, dataset_name: str, snapshots: List[Dict[str, Any]], snapshots_in_restic: List[Dict[str, Any]],
-                            keep_last_n: Optional[int], keep_weekly_n: Optional[int], keep_monthly_n: Optional[int]) -> Optional[Dict[str, Any]]:
+    def _find_next_snapshot(self,
+                            dataset_name: str,
+                            snapshots: List[Dict[str,
+                                                 Any]],
+                            snapshots_in_restic: List[Dict[str,
+                                                           Any]],
+                            keep_last_n: Optional[int],
+                            keep_weekly_n: Optional[int],
+                            keep_monthly_n: Optional[int]) -> Optional[Dict[str,
+                                                                            Any]]:
         """
         `snapshots` must be sorted by creation time.
         """
-        snapshot_names_in_restic = set([s["name"] for s in snapshots_in_restic])
+        snapshots_in_restic_by_name = {
+            s["name"]: s for s in snapshots_in_restic}
+        all_snapshots = {
+            **{s["name"]: s for s in snapshots},
+            **snapshots_in_restic_by_name,
+        }.values()
         for snapshot in snapshots:
             snapshot_name = snapshot["name"]
-            if not self._must_keep(snapshots, snapshot, keep_last_n, keep_weekly_n, keep_monthly_n):
-                print(F"Skipping snapshot {dataset_name}@{snapshot_name} because it does not need to be kept according to the policy.")
+            keep_reasons = self._keep_reasons(
+                all_snapshots, snapshot, keep_last_n, keep_weekly_n, keep_monthly_n)
+            print(
+                f"{dataset_name}@{snapshot_name} [{','.join(keep_reasons)}]",
+                end="")
+            if snapshot_name in snapshots_in_restic_by_name:
+                print(
+                    f" already uploaded as {snapshots_in_restic_by_name[snapshot_name]['id'][:8]}")
+                self._release(dataset_name, snapshot_name)
                 continue
-            if snapshot_name in snapshot_names_in_restic:
-                print(F"Skipping snapshot {dataset_name}@{snapshot_name} because it's already migrated.")
+            if not keep_reasons:
+                print(" no need to keep by retention policy")
+                self._release(dataset_name, snapshot_name)
                 continue
+            print()
             return snapshot
         return None
 
-    def _backup_next_snapshot_from_dataset(self, dataset_name, snapshots: List[Dict[str, Any]], keep_last_n: Optional[int], keep_weekly_n: Optional[int], keep_monthly_n: Optional[int]) -> Optional[Dict[str, Any]]:
+    def _backup_next_snapshot_from_dataset(self,
+                                           dataset_name,
+                                           is_volume,
+                                           snapshots: List[Dict[str,
+                                                                Any]],
+                                           keep_last_n: Optional[int],
+                                           keep_weekly_n: Optional[int],
+                                           keep_monthly_n: Optional[int]) -> Optional[Dict[str,
+                                                                                           Any]]:
         restic_repo, _ = self._get_repo_name_and_path(dataset_name)
 
         snapshots_in_restic = self._get_snapshots_in_restic(restic_repo)
         if self.dry_run:
             snapshots_in_restic += self._dry_run_finished_backups
 
-        snapshot = self._find_next_snapshot(dataset_name, snapshots, snapshots_in_restic, keep_last_n, keep_weekly_n, keep_monthly_n)
+        snapshot = self._find_next_snapshot(
+            dataset_name,
+            snapshots,
+            snapshots_in_restic,
+            keep_last_n,
+            keep_weekly_n,
+            keep_monthly_n)
         if snapshot is None:
-            print(f"No further snapshots need to backuped for {dataset_name}.")
+            print(
+                f"No further snapshots need to be uploaded for {dataset_name}.")
             return None
 
         parent_restic_snapshot_id = None
-        ancestors_in_restic = [ancestor for ancestor in snapshots_in_restic if ancestor["creation"] < snapshot["creation"]]
+        ancestors_in_restic = [
+            ancestor for ancestor in snapshots_in_restic if ancestor["creation"] < snapshot["creation"]]
         if len(ancestors_in_restic) > 0:
             parent_restic_snapshot_id = ancestors_in_restic[-1]["id"]
-        self._backup_single_snapshot(dataset_name, snapshot, parent_restic_snapshot_id)
+        self._backup_single_snapshot(
+            dataset_name,
+            is_volume,
+            snapshot,
+            parent_restic_snapshot_id)
         return snapshot
 
-    def backup_next_snapshot_from_dataset(self, dataset_name, keep_last_n: Optional[int], keep_weekly_n: Optional[int], keep_monthly_n: Optional[int]):
-        self._pre(dataset_name)
-        snapshots = self._get_dataset_snapshots(dataset_name)
-        self._backup_next_snapshot_from_dataset(dataset_name, snapshots, keep_last_n, keep_weekly_n, keep_monthly_n)
+    def backup_next_snapshot_from_dataset(
+            self,
+            dataset_name,
+            keep_last_n: Optional[int],
+            keep_weekly_n: Optional[int],
+            keep_monthly_n: Optional[int]):
+        is_volume = self._pre(dataset_name)
+        snapshots = self._get_dataset_snapshots(dataset_name, is_volume)
+        self._backup_next_snapshot_from_dataset(
+            dataset_name,
+            is_volume,
+            snapshots,
+            keep_last_n,
+            keep_weekly_n,
+            keep_monthly_n)
         self._post(dataset_name)
 
-    def _backup_dataset(self, dataset_name: str, keep_last_n: Optional[int], keep_weekly_n: Optional[int], keep_monthly_n: Optional[int]):
-        snapshots = self._get_dataset_snapshots(dataset_name)
+    def _backup_dataset(
+            self,
+            dataset_name: str,
+            is_volume: bool,
+            keep_last_n: Optional[int],
+            keep_weekly_n: Optional[int],
+            keep_monthly_n: Optional[int]):
+        snapshots = self._get_dataset_snapshots(dataset_name, is_volume)
         while True:
-            added_snapshot = self._backup_next_snapshot_from_dataset(dataset_name, snapshots, keep_last_n, keep_weekly_n, keep_monthly_n)
+            added_snapshot = self._backup_next_snapshot_from_dataset(
+                dataset_name, is_volume, snapshots, keep_last_n, keep_weekly_n, keep_monthly_n)
             if added_snapshot is None:
                 break
             index = snapshots.index(added_snapshot)
             snapshots = snapshots[index + 1:]
 
-    def backup_dataset(self, dataset_name: str, keep_last_n: Optional[int], keep_weekly_n: Optional[int], keep_monthly_n: Optional[int]):
-        self._pre(dataset_name)
-        self._backup_dataset(dataset_name, keep_last_n, keep_weekly_n, keep_monthly_n)
+    def backup_dataset(
+            self,
+            dataset_name: str,
+            keep_last_n: Optional[int],
+            keep_weekly_n: Optional[int],
+            keep_monthly_n: Optional[int]):
+        is_volume = self._pre(dataset_name)
+        self._backup_dataset(
+            dataset_name,
+            is_volume,
+            keep_last_n,
+            keep_weekly_n,
+            keep_monthly_n)
         self._post(dataset_name)
+
+
+def capture_exception(result, function, **kwargs):
+    try:
+        function(**kwargs)
+    except Exception as e:
+        print(f"Error: {e}")
+        captured = {
+            **kwargs,
+            "exception": str(e),
+        }
+        if isinstance(e, subprocess.CalledProcessError):
+            if e.stdout is not None:
+                captured["stdout"] = e.stdout
+            if e.stderr is not None:
+                captured["stderr"] = e.stderr
+        result["exceptions"].append(captured)
 
 
 def main():
     if os.geteuid() != 0:
         print("Please run as root.")
         exit(1)
-    parser = argparse.ArgumentParser(description='Migrate zfs backups to restic.')
-    parser.add_argument('-r', '--restic-repo-prefix', required=True,
-                        help='The prefix used for the restic repo. It is appended with the dataset name.')
-    parser.add_argument('-c', '--zfs-dataset-common-prefix', default="",
-                        help='The prefix which should be removed from each dataset name for use in the restic repo. Eg. backup01')
+
+    parser = argparse.ArgumentParser(
+        description='Upload ZFS snapshots to Restic.')
+    parser.add_argument(
+        '-r',
+        '--restic-repo-prefix',
+        required=True,
+        help='The S3 url (possibly including a prefix inside the bucket) used for the Restic repo. It is appended with the dataset name.')
+    parser.add_argument(
+        '-c',
+        '--zfs-dataset-common-prefix',
+        default="",
+        help='The prefix which should be removed from each dataset name for use in the Restic repo. E.g. backup01')
     parser.add_argument('-p', '--restic-password-file', required=True,
-                        help='The path to the restic password file.')
+                        help='The path to the Restic password file.')
+    parser.add_argument(
+        '--exclude-snapnames-regex',
+        required=False,
+        help='Do not consider ZFS snapshots whose snapname matches this regex for uploading.')
     parser.add_argument('--dry-run', required=False, action='store_true',
-                        help='Perform a dryrun, do not backup anything.')
+                        help='Perform a dry-run, do not backup anything.')
+    parser.add_argument('--check', required=False, action='store_true',
+                        help='Check (each) Restic repository after upload.')
+    parser.add_argument(
+        '--release',
+        default="",
+        help='Comma-separated list of ZFS holds that are released after a snapshot was processed (i.e., successfully uploaded or skipped) except on snapshots excluded by --exclude-snapnames-regex.')
 
-    subparsers = parser.add_subparsers(title='commands', description="The command to run", required=True, dest='subparser_name')
+    subparsers = parser.add_subparsers(
+        title='commands',
+        description="The command to run",
+        required=True,
+        dest='subparser_name')
 
-    parser_single_snapshot = subparsers.add_parser('single_snapshot', help='Backup a single snapshot')
-    parser_single_snapshot.add_argument('dataset_name',
-                                        help="The name of the dataset to backup.")
-    parser_single_snapshot.add_argument('snapshot_name',
-                                        help="The name of the snapshot to backup.")
-    parser_single_snapshot.add_argument('-P', '--parent_snapshot', default=None,
-                                        help="The name of the parent snapshot.")
+    parser_single_snapshot = subparsers.add_parser(
+        'single_snapshot', help='Backup a single snapshot')
+    parser_single_snapshot.add_argument(
+        'dataset_name', help="The name of the dataset to backup.")
+    parser_single_snapshot.add_argument(
+        'snapshot_name', help="The name of the snapshot to backup.")
+    parser_single_snapshot.add_argument(
+        '-P',
+        '--parent_snapshot',
+        default=None,
+        help="The name of the parent snapshot.")
 
-    parser_next_snapshot = subparsers.add_parser('next_snapshot_in_dataset', help='Backup the next snapshots of a dataset')
-    parser_next_snapshot.add_argument('dataset_name',
-                                      help="The name of the dataset to backup.")
-    parser_next_snapshot.add_argument('--keep-last-n', default=None, type=int,
-                                      help="Keep the last n snapshots. Defaults to all")
-    parser_next_snapshot.add_argument('--keep-weekly-n', default=None, type=int,
-                                      help="Keep the last n weekly snapshots. A weekly snapshot is the newest snapshot in a week. Defaults to all")
-    parser_next_snapshot.add_argument('--keep-monthly-n', default=None, type=int,
-                                      help="Keep the last n monthly snapshots. A monthly snapshot is the newest snapshot in a month. Defaults to all")
+    parser_next_snapshot = subparsers.add_parser(
+        'next_snapshot_in_dataset',
+        help='Backup the next snapshots of a dataset')
+    parser_next_snapshot.add_argument(
+        'dataset_name', help="The name of the dataset to backup.")
+    parser_next_snapshot.add_argument(
+        '--keep-last-n',
+        default=None,
+        type=int,
+        help="Keep the last n snapshots. Defaults to all")
+    parser_next_snapshot.add_argument(
+        '--keep-weekly-n',
+        default=None,
+        type=int,
+        help="Keep the last n weekly snapshots. A weekly snapshot is the newest snapshot in a week. Defaults to all")
+    parser_next_snapshot.add_argument(
+        '--keep-monthly-n',
+        default=None,
+        type=int,
+        help="Keep the last n monthly snapshots. A monthly snapshot is the newest snapshot in a month. Defaults to all")
 
-    parser_single_dataset = subparsers.add_parser('dataset', help='Backup all snapshots of a dataset')
-    parser_single_dataset.add_argument('dataset_name',
-                                       help="The name of the dataset to backup.")
-    parser_single_dataset.add_argument('--keep-last-n', default=None, type=int,
-                                       help="Keep the last n snapshots. Defaults to all")
-    parser_single_dataset.add_argument('--keep-weekly-n', default=None, type=int,
-                                       help="Keep the last n weekly snapshots. A weekly snapshot is the newest snapshot in a week. Defaults to all")
-    parser_single_dataset.add_argument('--keep-monthly-n', default=None, type=int,
-                                       help="Keep the last n monthly snapshots. A monthly snapshot is the newest snapshot in a month. Defaults to all")
+    parser_single_dataset = subparsers.add_parser(
+        'dataset', help='Backup all snapshots of one or multiple dataset(s)')
+    parser_single_dataset.add_argument(
+        'dataset_names',
+        help="The name(s) of the dataset(s) to backup. Multiple datasets can be given as separate consecutive arguments.",
+        nargs="*")
+    parser_single_dataset.add_argument(
+        '--keep-last-n',
+        default=None,
+        type=int,
+        help="Keep the last n snapshots. Defaults to all")
+    parser_single_dataset.add_argument(
+        '--keep-weekly-n',
+        default=None,
+        type=int,
+        help="Keep the last n weekly snapshots. A weekly snapshot is the newest snapshot in a week. Defaults to all")
+    parser_single_dataset.add_argument(
+        '--keep-monthly-n',
+        default=None,
+        type=int,
+        help="Keep the last n monthly snapshots. A monthly snapshot is the newest snapshot in a month. Defaults to all")
 
     args = parser.parse_args()
 
-    backuper = Backuper(restic_repo_prefix=args.restic_repo_prefix, zfs_dataset_common_prefix=args.zfs_dataset_common_prefix, restic_password_file=args.restic_password_file, dry_run=args.dry_run)
+    # Transform comma-separated tags into list of tags
+    if args.release:
+        args.release = [tag.strip() for tag in args.release.split(",")]
+    else:
+        args.release = []
+
+    backupper = Backupper(
+        restic_repo_prefix=args.restic_repo_prefix,
+        zfs_dataset_common_prefix=args.zfs_dataset_common_prefix,
+        restic_password_file=args.restic_password_file,
+        exclude_snapnames_regex=args.exclude_snapnames_regex,
+        check=args.check,
+        dry_run=args.dry_run,
+        release=args.release)
+
+    result = {
+        "args": vars(args),
+        "exceptions": [],
+    }
 
     if args.subparser_name == "single_snapshot":
         if args.parent_snapshot is None:
             print("Caution: No parent specified. This can greatly reduce performance.")
-        backuper.backup_single_snapshot(dataset_name=args.dataset_name, snapshot_name=args.snapshot_name, parent_restic_snapshot=args.parent_snapshot)
+        capture_exception(
+            result,
+            backupper.backup_single_snapshot,
+            dataset_name=args.dataset_name,
+            snapshot_name=args.snapshot_name,
+            parent_restic_snapshot=args.parent_snapshot)
     elif args.subparser_name == "next_snapshot_in_dataset":
-        backuper.backup_next_snapshot_from_dataset(dataset_name=args.dataset_name, keep_last_n=args.keep_last_n, keep_weekly_n=args.keep_weekly_n, keep_monthly_n=args.keep_monthly_n)
+        capture_exception(
+            result,
+            backupper.backup_next_snapshot_from_dataset,
+            dataset_name=args.dataset_name,
+            keep_last_n=args.keep_last_n,
+            keep_weekly_n=args.keep_weekly_n,
+            keep_monthly_n=args.keep_monthly_n)
     elif args.subparser_name == "dataset":
-        backuper.backup_dataset(dataset_name=args.dataset_name, keep_last_n=args.keep_last_n, keep_weekly_n=args.keep_weekly_n, keep_monthly_n=args.keep_monthly_n)
+        for dataset_name in args.dataset_names:
+            print(f"Start processing dataset {dataset_name}")
+            capture_exception(
+                result,
+                backupper.backup_dataset,
+                dataset_name=dataset_name,
+                keep_last_n=args.keep_last_n,
+                keep_weekly_n=args.keep_weekly_n,
+                keep_monthly_n=args.keep_monthly_n)
+
+    return result
 
 
 if __name__ == "__main__":
-    main()
+    log_stream = Unbuffered(sys.stderr)
+    with RedirectStdStreams(stdout=log_stream, stderr=log_stream):
+        result = main()
+    print(json.dumps(result, indent=4))
+    if result["exceptions"] != []:
+        sys.exit(1)

@@ -1,42 +1,37 @@
-# Role Name
+# zfs_restic_uploader
 
-A brief description of the role goes here.
-
-
-## Requirements
-
-Any pre-requisites that may not be covered by Ansible itself or the role should be mentioned here.
-For instance, if the role uses the EC2 module or depends on other Ansible roles, it may be a good idea to mention in this section that the boto package is required.
-
+Ansible role that deploys our `zfs-restic-uploader` script and configures a corresponding systemd service and timer.
 
 ## Role Variables
 
-A description of the settable variables for this role should go here, including any variables that are in defaults/main.yml, vars/main.yml, and any variables that can/should be set via parameters to the role.
-Any variables that are read from other roles and/or the global scope (ie. hostvars, group vars, etc.) should be mentioned here as well.
+| Name                            | Required/Default   | Description                                                                                                                                                               |
+| ------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `zru_access_key_id`             | :heavy_check_mark: | S3 access key for the restic repository                                                                                                                                   |
+| `zru_secret_access_key`         | :heavy_check_mark: | S3 secret key for the restic repository                                                                                                                                   |
+| `zru_restic_repo_password`      | :heavy_check_mark: | Restic repository password (for encryption at rest)                                                                                                                       |
+| `zru_restic_repo_prefix`        | :heavy_check_mark: | The S3 url (possibly including a prefix inside the bucket) used for the restic repo. It is appended with the dataset name.                                                |
+| `zru_restic_check`              | `True`             | Whether to run `restic check` after finishing uploading to a Restic repository                                                                                            |
+| `zru_schedule`                  | `"*-*-* 4:00:00"`  | Schedule for systemd timer                                                                                                                                                |
+| `zru_keep_last_n`               | `0`                | Number of last snapshots to keep. This gets passed to `zfs-restic-uploader`'s `--keep-last-n` flag.                                                                       |
+| `zru_keep_weekly_n`             | `0`                | Number of weekly snapshots to keep. This gets passed to `zfs-restic-uploader`'s `--keep-last-n` flag.                                                                     |
+| `zru_keep_monthly_n`            | `0`                | Number of monthly snapshots to keep. This gets passed to `zfs-restic-uploader`'s `--keep-last-n` flag.                                                                    |
+| `zru_cache_directory`           | `/var/cache`       | Cache directory for Restic. This gets passed via the environment variable `$XDG_CACHE_HOME`.                                                                              |
+| `zru_exclude_snapnames_regex`   | `a^`               | Snapshots whose snapname matches this regex are ignored. The default of `a^` is a regex that is impossible to match, so nothing will be ignored.                          |
+| `zru_release_holds`             | `[]`               | List of ZFS holds that are released after a snapshot was processed (i.e., successfully uploaded or skipped) except on snapshots excluded by `zru_exclude_snapnames_regex` |
+| `zru_zfs_dataset_common_prefix` | `""`               | The prefix which should be removed from each dataset name for use in the restic repo. E.g. `backup01`                                                                     |
+| `zru_zfs_datasets`              | `[]`               | Names of the datasets to backup.                                                                                                                                          |
 
-Don't forget to indent the markdown table so it is readable even if not rendered.
+## Retention
 
-| Name       | Required/Default         | Description                                                                                        |
-|------------|:------------------------:|----------------------------------------------------------------------------------------------------|
-| `example1` | :heavy_check_mark:       | Lorem ipsum dolor sit amet, consetetur sadipscing elitr,                                           |
-| `example2` | :heavy_multiplication_x: | Sed diam nonumy eirmod tempor invidunt ut labore et dolore magna aliquyam erat, sed diam voluptua. |
-| `example3` | `True`                   | Stet clita kasd gubergren                                                                          |
-| `example4` | `5`                      | No sea takimata sanctus est Lorem ipsum dolor sit amet.                                            |
+The `zru_keep_*` variables configure the desired retention policy analogous to the flags supported by `restic forget`.
+However, note that `zfs-restic-uploader` doesn't delete anything.
+When a snapshot doesn't meet the retention policy, that only means that it will not be uploaded (and ZFS holds listed in `zru_release_holds` get released).
+If they are already uploaded, they will not be deleted from the Restic repository by this tool.
 
+In order to delete snapshots that don't (anymore) meet the retention policy, you need to run `restic forget` on the repository yourself.
 
-## Example
-
-Including an example of how to use your role (for instance, with variables passed in as parameters) is always nice for users too:
-
-```yml
-```
-
+When all of the `zru_keep_*` variables are set to `0`, then a special case applies where all (instead of zero) snapshots are uploaded (except of course those snapshots excluded via `zru_exclude_snapnames_regex`).
 
 ## License
 
 This work is licensed under the [MIT License](./LICENSE).
-
-
-## Author Information
-
-- [Author Name (nickname)](github profile) _givenname.familyname at stuvus.uni-stuttgart.de_

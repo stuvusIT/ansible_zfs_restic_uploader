@@ -1,0 +1,10 @@
+zru_restic_check: True
+zru_schedule: "*-*-* 4:00:00"
+zru_keep_last_n: 0
+zru_keep_weekly_n: 0
+zru_keep_monthly_n: 0
+zru_cache_directory: /var/cache
+zru_exclude_snapnames_regex: a^ # This regex doesn't match anything
+zru_release_holds: []
+zru_zfs_dataset_common_prefix: ""
+zru_zfs_datasets: []
