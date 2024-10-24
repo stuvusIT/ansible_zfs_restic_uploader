@@ -1,0 +1,10 @@
+# {{ ansible_managed }}
+[Unit]
+Description=upload ZFS snapshots to restic repository
+
+[Timer]
+OnCalendar={{ zru_schedule }}
+Unit=kopia.service
+
+[Install]
+WantedBy=timers.target

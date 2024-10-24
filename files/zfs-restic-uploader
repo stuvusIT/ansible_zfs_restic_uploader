@@ -7,6 +7,9 @@ import subprocess
 import datetime
 import json
 import udatetime
+import re
+import sys
+
 
 ZFS_SNAPSHOTDIR = '.zfs/snapshot'
 
@@ -16,18 +19,32 @@ LOGICAL_REFERENCED_TAG = "logicalreferenced="
 DEBUG = False
 
 
-def _run(command: str, input: Optional[str] = None, void_stderr: bool = False) -> None:
+# class which we use to prevent buffering stdout
+class Unbuffered(object):
+   def __init__(self, stream):
+       self.stream = stream
+   def write(self, data):
+       self.stream.write(data)
+       self.stream.flush()
+   def writelines(self, datas):
+       self.stream.writelines(datas)
+       self.stream.flush()
+   def __getattr__(self, attr):
+       return getattr(self.stream, attr)
+
+
+def _run(command: str, input: Optional[str] = None, void_stderr: bool = False, check: bool = True) -> None:
     other_args = dict()
     if void_stderr and not DEBUG:
         other_args["stderr"] = subprocess.DEVNULL
-    subprocess.run(command, shell=True, text=True, input=input, **other_args)
+    subprocess.run(command, shell=True, text=True, input=input, check=check, **other_args)
 
 
-def _eval(command: str, input: Optional[str] = None, void_stderr: bool = False) -> str:
+def _eval(command: str, input: Optional[str] = None, void_stderr: bool = False, check: bool = True) -> str:
     other_args = dict()
     if void_stderr and not DEBUG:
         other_args["stderr"] = subprocess.DEVNULL
-    return subprocess.run(command, shell=True, text=True, stdout=subprocess.PIPE, input=input, **other_args).stdout
+    return subprocess.run(command, shell=True, text=True, stdout=subprocess.PIPE, input=input, check=check, **other_args).stdout
 
 
 def _get_year(timestamp: int) -> int:
@@ -48,10 +65,12 @@ class Backuper:
                  restic_repo_prefix: str,
                  zfs_dataset_common_prefix: str,
                  restic_password_file: str,
+                 exclude_snapnames_regex: str,
                  dry_run: bool):
         self.restic_repo_prefix: str = restic_repo_prefix.rstrip("/")
         self.zfs_dataset_common_prefix: str = zfs_dataset_common_prefix
         self.restic_password_file: str = restic_password_file
+        self.exclude_snapnames_regex = re.compile(exclude_snapnames_regex)
         self.dry_run: bool = dry_run
         self._dry_run_finished_backups: List[Dict[str, Any]] = []
 
@@ -62,7 +81,7 @@ class Backuper:
         return f"restic {arg_string}"
 
     def _get_dataset_snapshots(self, dataset_name: str) -> List[Dict[str, Any]]:
-        lines = _eval(f"sudo zfs list -Hp -o name,creation,used,logicalreferenced -t snapshot '{dataset_name}'")
+        lines = _eval(f"zfs list -Hp -o name,creation,used,logicalreferenced -t snapshot '{dataset_name}'")
         snapshots: List[Dict[str, Any]] = []
         for line in lines.split("\n"):
             if len(line) == 0:
@@ -77,15 +96,18 @@ class Backuper:
             snapshots.append(snapshot)
         snapshots_with_size = []
         for i, snapshot in enumerate(snapshots):
+            snapshot_name = snapshot["name"]
+            if self.exclude_snapnames_regex.match(snapshot["name"]):
+                print(f"Not considering snapshot {dataset_name}@{snapshot_name} - excluded by regex")
+                continue
             if i == 0 or snapshots[i - 1]["used"] != 0:
                 snapshots_with_size.append(snapshot)
                 continue
             parent_name = snapshots[i - 1]["name"]
-            snapshot_name = snapshot["name"]
             if "0\n" != _eval(f"zfs diff {dataset_name}@{parent_name} {dataset_name}@{snapshot_name} 2>&1 | head -c1 | wc -c"):
                 snapshots_with_size.append(snapshot)
                 continue
-            print(F"Not considering snapshot {dataset_name}@{snapshot_name} because of zero diff.")
+            print(f"Not considering snapshot {dataset_name}@{snapshot_name} because of zero diff.")
         return snapshots_with_size
 
     def _get_snapshot_tag(self, datum: Dict[str, Any]) -> str:
@@ -125,7 +147,7 @@ class Backuper:
         _run(self._restic_cmd(restic_repo, "check"))
 
     def _pre(self, dataset_name):
-        _run(f"zfs mount {dataset_name}")
+        _run(f"zfs mount {dataset_name}", check=False)
         restic_repo, _ = self._get_repo_name_and_path(dataset_name)
         self._init_restic_repo(restic_repo)
 
@@ -142,8 +164,12 @@ class Backuper:
 
         snapshot_time_readable = str(datetime.datetime.fromtimestamp(snapshot["creation"]))
 
+        # Hack to allow colon in snapname
+        tmpdir = _eval("mktemp -d").strip()
+        _run(f"ln -s {snapshot_path} {tmpdir}/snapshot")
+
         # Use proot to "mount" coorect path. See https://github.com/restic/restic/issues/2092
-        proot_command = f"proot -b '{snapshot_path}':'{path_in_restic_repo}'"
+        proot_command = f"proot -b '{tmpdir}/snapshot':'{path_in_restic_repo}'"
         logical_referenced = snapshot["logicalreferenced"]
         tags = [f"{SNAPSHOT_TAG}{snapshot_name}",
                 f"{LOGICAL_REFERENCED_TAG}{logical_referenced}"]
@@ -151,7 +177,7 @@ class Backuper:
         for tag in tags:
             tags_with_flag.append("--tag")
             tags_with_flag.append(tag)
-        restic_backup_args = ["--ignore-ctime", "--time", snapshot_time_readable, "--compression", "max"] + tags_with_flag
+        restic_backup_args = ["--ignore-ctime", "--time", snapshot_time_readable, "--compression", "max", "--exclude-caches"] + tags_with_flag
         if parent_restic_snapshot_id is not None:
             restic_backup_args += ["--parent", parent_restic_snapshot_id]
         restic_backup_args.append(path_in_restic_repo)
@@ -229,7 +255,7 @@ class Backuper:
                 print(F"Skipping snapshot {dataset_name}@{snapshot_name} because it does not need to be kept according to the policy.")
                 continue
             if snapshot_name in snapshot_names_in_restic:
-                print(F"Skipping snapshot {dataset_name}@{snapshot_name} because it's already migrated.")
+                print(F"Skipping snapshot {dataset_name}@{snapshot_name} because it's already uploaded.")
                 continue
             return snapshot
         return None
@@ -243,7 +269,7 @@ class Backuper:
 
         snapshot = self._find_next_snapshot(dataset_name, snapshots, snapshots_in_restic, keep_last_n, keep_weekly_n, keep_monthly_n)
         if snapshot is None:
-            print(f"No further snapshots need to backuped for {dataset_name}.")
+            print(f"No further snapshots need to be uploaded for {dataset_name}.")
             return None
 
         parent_restic_snapshot_id = None
@@ -278,15 +304,20 @@ def main():
     if os.geteuid() != 0:
         print("Please run as root.")
         exit(1)
-    parser = argparse.ArgumentParser(description='Migrate zfs backups to restic.')
+
+    sys.stdout = Unbuffered(sys.stdout)
+
+    parser = argparse.ArgumentParser(description='Upload ZFS snapshots to restic.')
     parser.add_argument('-r', '--restic-repo-prefix', required=True,
                         help='The prefix used for the restic repo. It is appended with the dataset name.')
     parser.add_argument('-c', '--zfs-dataset-common-prefix', default="",
                         help='The prefix which should be removed from each dataset name for use in the restic repo. Eg. backup01')
     parser.add_argument('-p', '--restic-password-file', required=True,
                         help='The path to the restic password file.')
+    parser.add_argument('--exclude-snapnames-regex', required=False,
+                        help='Do not consider ZFS snapshots whose snapname matches this regex for uploading.')
     parser.add_argument('--dry-run', required=False, action='store_true',
-                        help='Perform a dryrun, do not backup anything.')
+                        help='Perform a dry-run, do not backup anything.')
 
     subparsers = parser.add_subparsers(title='commands', description="The command to run", required=True, dest='subparser_name')
 
@@ -320,7 +351,7 @@ def main():
 
     args = parser.parse_args()
 
-    backuper = Backuper(restic_repo_prefix=args.restic_repo_prefix, zfs_dataset_common_prefix=args.zfs_dataset_common_prefix, restic_password_file=args.restic_password_file, dry_run=args.dry_run)
+    backuper = Backuper(restic_repo_prefix=args.restic_repo_prefix, zfs_dataset_common_prefix=args.zfs_dataset_common_prefix, restic_password_file=args.restic_password_file, exclude_snapnames_regex=args.exclude_snapnames_regex, dry_run=args.dry_run)
 
     if args.subparser_name == "single_snapshot":
         if args.parent_snapshot is None:
