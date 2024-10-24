@@ -1,0 +1,21 @@
+# {{ ansible_managed }}
+[Unit]
+Description=upload ZFS snapshots to restic repository
+Requires=zfs.target
+After=zfs.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/zfs-restic-uploader/env
+{% for dataset_name in zru_zfs_datasets %}
+ExecStart=/opt/zfs-restic-uploader \
+    -r {{ zru_restic_repo_prefix | quote }} \
+    -p /etc/zfs-restic-uploader/restic-password \
+    -c {{ zru_zfs_dataset_common_prefix | quote }} \
+    --exclude-snapnames-regex {{ zru_exclude_snapnames_regex | quote }} \
+    dataset {{ dataset_name | quote }} \
+    --keep-last-n {{ zru_keep_last_n | quote }} \
+    --keep-weekly-n {{ zru_keep_weekly_n | quote }} \
+    --keep-monthly-n {{ zru_keep_monthly_n | quote }}
+{% endfor %}
+Restart=on-failure
